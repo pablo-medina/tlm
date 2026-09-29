@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { ConfigError, loadConfig } from './config/load.js';
 import { ConfigWatcher } from './config/watcher.js';
 import { createLogger } from './logger.js';
+import { SecretScrubber } from './redact.js';
 import { Runtime } from './runtime.js';
 import { buildServer } from './server.js';
 
@@ -15,8 +16,9 @@ async function main(): Promise<void> {
 
   const configPath = resolve(values.config ?? process.env.TLM_CONFIG ?? 'config.yaml');
   const config = await loadConfig(configPath);
-  const logger = createLogger(config.logging);
-  const runtime = new Runtime(config, logger);
+  const scrubber = new SecretScrubber(config);
+  const logger = createLogger(config.logging, scrubber);
+  const runtime = new Runtime(config, logger, scrubber);
   const app = buildServer(runtime, logger);
 
   const watcher = new ConfigWatcher({

@@ -46,7 +46,9 @@ export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env
   try {
     raw = parseYaml(source);
   } catch (error) {
-    throw new ConfigError(`invalid YAML: ${(error as Error).message}`);
+    // Keep only the first line: the rest is a source excerpt that could contain a hard-coded secret.
+    const [summary] = (error as Error).message.split('\n');
+    throw new ConfigError(`invalid YAML: ${summary}`);
   }
   if (raw === null || typeof raw !== 'object') {
     throw new ConfigError('configuration must be a YAML mapping');

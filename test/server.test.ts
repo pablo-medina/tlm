@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   chat,
+  json,
   createApp,
   makeConfig,
   okHandler,
@@ -374,5 +375,127 @@ describe('health endpoint', () => {
       config: { generation: 1 },
       targets: [{ target: 'a/m', consecutiveFailures: 1, lastError: 'HTTP 500' }],
     });
+  });
+});
+
+describe('multimodal requests', () => {
+  const image = `data:image/png;base64,${Buffer.alloc(300_000, 1).toString('base64')}`;
+  const pdf = `data:application/pdf;base64,${Buffer.alloc(50_000, 2).toString('base64')}`;
+  const messages = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Summarize the document and describe the image.' },
+        { type: 'image_url', image_url: { url: image, detail: 'high' } },
+        { type: 'image_url', image_url: { url: 'https://example.com/cat.jpg' } },
+        { type: 'file', file: { filename: 'report.pdf', file_data: pdf } },
+      ],
+    },
+  ];
+
+  it('forwards image and file content parts unchanged', async () => {
+    const a = await upstream(okHandler('seen'));
+    const { app: server } = app({
+      providers: { a: { baseUrl: a.url } },
+      routes: { vision: { targets: [{ provider: 'a', model: 'gpt-4o' }] } },
+    });
+
+    const res = await server.inject(chat('vision', { messages, max_tokens: 50 }));
+
+    expect(res.statusCode).toBe(200);
+    expect(a.received[0]!.body).toEqual({ model: 'gpt-4o', messages, max_tokens: 50 });
+  });
+
+  it('enforces server.bodyLimit with an OpenAI-style 413', async () => {
+    const a = await upstream(okHandler('seen'));
+    const routes = { vision: { targets: [{ provider: 'a', model: 'm' }] } };
+
+    const small = app({
+      server: { bodyLimit: 100_000 },
+      providers: { a: { baseUrl: a.url } },
+      routes,
+    });
+    const rejected = await small.app.inject(chat('vision', { messages }));
+    expect(rejected.statusCode).toBe(413);
+    expect(rejected.json().error.type).toBe('invalid_request_error');
+    expect(a.received).toHaveLength(0);
+
+    const large = app({
+      server: { bodyLimit: 1_000_000 },
+      providers: { a: { baseUrl: a.url } },
+      routes,
+    });
+    expect((await large.app.inject(chat('vision', { messages }))).statusCode).toBe(200);
+  });
+
+  it('summarizes base64 payloads in logged bodies', async () => {
+    const a = await upstream(okHandler('seen'));
+    const { app: server, logs } = app({
+      logging: { level: 'debug', logBodies: true },
+      providers: { a: { baseUrl: a.url } },
+      routes: { vision: { targets: [{ provider: 'a', model: 'm' }] } },
+    });
+
+    await server.inject(chat('vision', { messages }));
+
+    const output = logs.join('');
+    expect(output).toContain('data:image/png;base64,…[293.0 KB]');
+    expect(output).toContain('data:application/pdf;base64,…[48.8 KB]');
+    expect(output).toContain('https://example.com/cat.jpg');
+    expect(output.length).toBeLessThan(20_000);
+  });
+});
+
+describe('log safety', () => {
+  it('never exposes provider API keys in logs or client responses, even when an upstream echoes them', async () => {
+    const key = 'sk-proj-SuperSecretKey1234567890';
+    const a = await upstream((req, res) =>
+      json(res, 401, {
+        error: {
+          message: `Incorrect API key provided: ${key}. Header was ${req.headers.authorization}`,
+        },
+      }),
+    );
+    const { app: server, logs } = app({
+      logging: { level: 'trace', logBodies: true },
+      providers: {
+        a: { baseUrl: a.url, apiKey: key, headers: { 'x-api-key': 'another-secret-value' } },
+      },
+      routes: { smart: { targets: [{ provider: 'a', model: 'm' }] } },
+    });
+
+    const res = await server.inject(chat('smart'));
+    await server.inject({ method: 'GET', url: '/health' });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toContain('Incorrect API key provided');
+    expect(res.body).not.toContain(key);
+    const output = logs.join('');
+    expect(output).toContain('upstream error body');
+    expect(output).not.toContain(key);
+    expect(output).not.toContain('SuperSecretKey');
+    expect(output).not.toContain('another-secret-value');
+  });
+
+  it('uses the new keys after a configuration reload', async () => {
+    const a = await upstream((_req, res) =>
+      json(res, 500, { error: { message: 'key sk-rotated-key-abcdefgh rejected' } }),
+    );
+    const input = {
+      logging: { level: 'debug', logBodies: true },
+      providers: { a: { baseUrl: a.url, apiKey: 'sk-original-key-12345678' } },
+      routes: { smart: { targets: [{ provider: 'a', model: 'm' }] } },
+    };
+    const { app: server, runtime, logs } = app(input);
+
+    runtime.apply(
+      makeConfig({
+        ...input,
+        providers: { a: { baseUrl: a.url, apiKey: 'sk-rotated-key-abcdefgh' } },
+      }),
+    );
+    await server.inject(chat('smart'));
+
+    expect(logs.join('')).not.toContain('sk-rotated-key-abcdefgh');
   });
 });

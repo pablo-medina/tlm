@@ -2,6 +2,7 @@ import { Readable } from 'node:stream';
 import type { FastifyBaseLogger, FastifyReply, FastifyRequest } from 'fastify';
 import type { TargetConfig } from '../config/schema.js';
 import { targetKey } from '../routing/strategies.js';
+import { summarizeForLog, summarizeTextForLog } from '../redact.js';
 import type { Runtime } from '../runtime.js';
 import { describeError, sendUpstream, type UpstreamResponse } from '../upstream/client.js';
 import { sendError } from './errors.js';
@@ -103,7 +104,7 @@ export async function proxyRequest(
     },
     'routing request',
   );
-  if (config.logging.logBodies) log.debug({ body }, 'request body');
+  if (config.logging.logBodies) log.debug({ body: summarizeForLog(body) }, 'request body');
 
   // Abort the upstream call if the client goes away before we finish responding.
   const abort = new AbortController();
@@ -175,7 +176,7 @@ export async function proxyRequest(
 
     const contentType = header(res, 'content-type');
 
-    // Upstream error status: fall back if retryable, otherwise pass it through untouched.
+    // Upstream error status: fall back if retryable, otherwise pass it through (minus any echoed secrets).
     if (res.statusCode >= 400) {
       const errorBody = await res.body.text().catch(() => '');
       clearTimeout(timer);
@@ -188,7 +189,8 @@ export async function proxyRequest(
           'non-retryable upstream error; returning it to the client',
         );
       }
-      if (config.logging.logBodies) attemptLog.debug({ body: errorBody }, 'upstream error body');
+      if (config.logging.logBodies)
+        attemptLog.debug({ body: summarizeTextForLog(errorBody) }, 'upstream error body');
       setRoutingHeaders(reply, res, routeName, target, attempt);
       log.info(
         { status: res.statusCode, target: key, attempts: attempt, durationMs: elapsed(started) },
@@ -197,7 +199,7 @@ export async function proxyRequest(
       return reply
         .code(res.statusCode)
         .type(contentType ?? 'application/json')
-        .send(errorBody);
+        .send(runtime.scrub(errorBody));
     }
 
     // Buffered (non-streaming) response.
@@ -213,7 +215,8 @@ export async function proxyRequest(
         clearTimeout(timer);
       }
       runtime.health.recordSuccess(key, elapsed(attemptStarted));
-      if (config.logging.logBodies) attemptLog.debug({ body: text }, 'response body');
+      if (config.logging.logBodies)
+        attemptLog.debug({ body: summarizeTextForLog(text) }, 'response body');
       log.info(
         {
           status: res.statusCode,
@@ -316,7 +319,7 @@ export async function proxyRequest(
     return reply
       .code(lastFailure.status)
       .type(lastFailure.contentType ?? 'application/json')
-      .send(lastFailure.body);
+      .send(runtime.scrub(lastFailure.body));
   }
   const timeout = lastFailure?.kind === 'network' && lastFailure.timeout;
   return sendError(

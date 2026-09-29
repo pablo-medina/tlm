@@ -1,5 +1,6 @@
 import type { Logger } from 'pino';
 import type { Config } from './config/schema.js';
+import type { SecretScrubber } from './redact.js';
 import { HealthTracker } from './routing/health.js';
 import { Router } from './routing/router.js';
 import { targetKey } from './routing/strategies.js';
@@ -26,6 +27,7 @@ export class Runtime {
   constructor(
     config: Config,
     private readonly logger: Logger,
+    private readonly scrubber?: SecretScrubber,
   ) {
     this.health = new HealthTracker(config.health);
     this.router = new Router(this.health);
@@ -47,6 +49,8 @@ export class Runtime {
     if (config.logging.pretty !== previous.config.logging.pretty)
       restartRequired.push('logging.pretty');
 
+    // Register the new secrets before anything logs with the new configuration.
+    this.scrubber?.update(config);
     this.health.updateConfig(config.health);
     this.logger.level = config.logging.level;
     this.generation = this.createGeneration(previous.id + 1, config);
@@ -75,6 +79,11 @@ export class Runtime {
     return Object.values(this.generation.config.routes).flatMap((route) =>
       route.targets.map(targetKey),
     );
+  }
+
+  /** Removes provider credentials from text that leaves TLM (logs, upstream error bodies). */
+  scrub(text: string): string {
+    return this.scrubber ? this.scrubber.scrub(text) : text;
   }
 
   async close(): Promise<void> {

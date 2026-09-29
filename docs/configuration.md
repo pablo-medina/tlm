@@ -20,19 +20,22 @@ already set are not overridden.
 
 ## `server`
 
-| Key         | Type   | Default    | Notes                                        |
-| ----------- | ------ | ---------- | -------------------------------------------- |
-| `host`      | string | `0.0.0.0`  | Restart required to change.                  |
-| `port`      | int    | `30000`    | Restart required to change.                  |
-| `bodyLimit` | int    | `10485760` | Max request body in bytes. Restart required. |
+| Key         | Type   | Default    | Notes                                                                                                                                                    |
+| ----------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host`      | string | `0.0.0.0`  | Restart required to change.                                                                                                                              |
+| `port`      | int    | `30000`    | Restart required to change.                                                                                                                              |
+| `bodyLimit` | int    | `10485760` | Max request body in bytes. Base64 images/PDFs are ~33% larger than the file, so raise it for vision/document routes (e.g. `52428800`). Restart required. |
 
 ## `logging`
 
-| Key         | Type    | Default | Notes                                                                         |
-| ----------- | ------- | ------- | ----------------------------------------------------------------------------- |
-| `level`     | enum    | `info`  | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Hot-reloadable. |
-| `pretty`    | boolean | `false` | Human-readable single-line output. Restart required.                          |
-| `logBodies` | boolean | `false` | Log request/response bodies at `debug` level. Hot-reloadable.                 |
+| Key         | Type    | Default | Notes                                                                                                                |
+| ----------- | ------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `level`     | enum    | `info`  | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Hot-reloadable.                                        |
+| `pretty`    | boolean | `false` | Human-readable single-line output. Restart required.                                                                 |
+| `logBodies` | boolean | `false` | Log request/response bodies at `debug` level, with base64 payloads and embedding vectors summarized. Hot-reloadable. |
+
+API keys, sensitive provider headers, proxy passwords and `Bearer` tokens are always scrubbed from
+log output, whatever the level (see the README's Logging section).
 
 ## `proxy`
 

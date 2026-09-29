@@ -10,6 +10,9 @@
 server:
   host: 0.0.0.0
   port: 30000 # changing host/port/bodyLimit requires a restart
+  # Max request size. Images and PDFs sent inline as base64 are ~33% larger than the file,
+  # so vision/document routes usually need more than the 10 MB default.
+  bodyLimit: 52428800 # 50 MB
 
 logging:
   level: info # trace | debug | info | warn | error | fatal | silent
@@ -74,6 +77,26 @@ routes:
     targets:
       - { provider: groq, model: llama-3.1-8b-instant }
       - { provider: openai, model: gpt-4o-mini }
+
+  # Image understanding. Clients send `image_url` content parts (https URLs or base64
+  # data URIs); TLM forwards them untouched. TLM does not check model capabilities:
+  # every target of a vision route must accept images (otherwise it is a config error
+  # and the provider's 400 is returned to the client).
+  vision:
+    strategy: priority
+    targets:
+      - { provider: openai, model: gpt-4o }
+      - { provider: groq, model: meta-llama/llama-4-scout-17b-16e-instruct }
+      - { provider: ollama, model: llama3.2-vision }
+
+  # Document reading. Clients send PDFs as `file` content parts with base64 `file_data`
+  # (uploaded `file_id`s are provider-specific and cannot be routed). Fewer providers
+  # accept files than images, so this route only lists models that do.
+  documents:
+    strategy: priority
+    targets:
+      - { provider: openai, model: gpt-4.1 }
+      - { provider: openai, model: gpt-4o }
 
   # Single target, no fallback.
   embeddings:

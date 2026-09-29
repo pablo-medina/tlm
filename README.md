@@ -16,7 +16,9 @@ It does one thing: routing. No prompt management, no caching, no UI.
 - **Health tracking:** failing targets enter a cooldown and are deprioritized automatically.
 - **Outbound proxy:** optional global HTTP(S) proxy with `noProxy` rules and per-provider overrides.
 - **Hot reload:** the YAML configuration is watched; valid changes apply without a restart.
-- **Observable:** structured logs (JSON or pretty) for every request, attempt, fallback and reload.
+- **Multimodal passthrough:** images, PDFs and audio content parts are forwarded untouched.
+- **Observable:** structured logs (JSON or pretty) for every request, attempt, fallback and reload,
+  with API keys scrubbed and base64 payloads summarized.
 
 ## Quick start
 
@@ -140,7 +142,10 @@ Level changes are applied on hot reload.
   and token usage) and configuration reloads.
 - `debug` also logs each attempt start (upstream model, timeout, proxy), stream start and time to
   first byte, and every HTTP response.
-- `logging.logBodies: true` logs request and response bodies at `debug` level. Treat those logs as sensitive.
+- `logging.logBodies: true` logs request and response bodies at `debug` level. Base64 payloads
+  (images, PDFs, audio, `b64_json`) are logged as their size, for example
+  `data:image/png;base64,…[1.2 MB]`, and embedding vectors as `[1536 numbers]`. Prompts and
+  completions are still logged in full, so treat these logs as sensitive.
 - `logging.pretty: true` prints human-readable single-line logs. Otherwise TLM writes JSON lines.
 
 ```
@@ -148,6 +153,42 @@ Level changes are applied on hot reload.
 12:00:01.560 WARN: attempt failed {"attempt":1,"target":"openai/gpt-4o","reason":"HTTP 429","next":"fallback"}
 12:00:02.101 INFO: request completed {"status":200,"target":"groq/llama-3.3-70b-versatile","attempts":2,"durationMs":867,"usage":{...}}
 ```
+
+**Credentials never reach the logs.** Before a log line is written, TLM replaces these values with
+`[redacted]`:
+
+- every provider `apiKey`;
+- the values of sensitive provider headers (names containing `auth`, `key`, `token`, `secret`,
+  `cookie`, `session` or `signature`);
+- proxy passwords;
+- any `Bearer <token>`.
+
+This applies to every line, including upstream error bodies that echo a key. Upstream error bodies
+returned to clients are scrubbed the same way. Successful responses pass through untouched. The list of secrets is
+refreshed on every configuration reload. Values shorter than 8 characters are not matched, because
+they would mangle unrelated text. Configuration errors do not print the YAML source.
+
+## Images, documents and other multimodal input
+
+TLM forwards request bodies unchanged apart from `model`, so multimodal content parts work with any
+provider that supports them:
+
+- **Images:** `image_url` parts, with an `https://` URL or a base64 `data:` URI.
+- **PDFs and other documents:** `file` parts with base64 `file_data`.
+- **Audio:** `input_audio` parts.
+
+TLM does not check model capabilities. Every target in a vision or document route must accept that
+input. If one does not, that is a configuration error: the provider's `400` is returned to the client
+without a fallback. See the `vision` and `documents` routes in
+[config.example.yaml](config.example.yaml).
+
+Two things to keep in mind:
+
+- **`server.bodyLimit` defaults to 10 MB.** Base64 payloads are about 33% larger than the original
+  file. Raise the limit for image and document routes; the example config uses 50 MB. Requests over
+  the limit get a `413`.
+- **Uploaded files (`file_id`) are not supported.** A `file_id` only exists on the provider it was
+  uploaded to, so it cannot be routed or used in a fallback. Send content inline instead.
 
 ## Outbound proxy
 

@@ -17,7 +17,8 @@ src/
   index.ts              Entry point: CLI args, .env, startup, signals, graceful shutdown
   server.ts             Fastify app: routes, request ids, error/404 handlers
   runtime.ts            Active config generation + state that survives reloads
-  logger.ts             pino logger factory
+  logger.ts             pino logger factory (every line passes through the SecretScrubber)
+  redact.ts             SecretScrubber and body summarizing for logs
   config/
     schema.ts           zod schema, defaults and derived types (single source of truth)
     load.ts             YAML parsing, ${ENV} interpolation, validation errors
@@ -60,6 +61,11 @@ forwarded unchanged. Upstream responses are forwarded unchanged as well.
 **Timeouts use an AbortSignal per attempt.** undici's own timers are coarse (about one second), so
 each attempt has a precise deadline combined with the client-disconnect signal. undici's
 `bodyTimeout` remains the idle timeout for streams.
+
+**Secrets are scrubbed at the output.** Instead of trusting every call site, the logger's
+`streamWrite` hook removes every configured credential (and any `Bearer` token) from each serialized
+line. This also covers error messages and upstream bodies that echo a key. `Runtime.apply` refreshes
+the list on reload.
 
 **No client auth.** TLM is designed for private networks. Put it behind a gateway if it must be
 exposed.

@@ -21,7 +21,10 @@ Read `docs/architecture.md` before making structural changes.
 6. **Pass bodies through.** Only read or modify the request fields routing needs (`model`, `stream`).
    Forward upstream responses unchanged.
 7. **Log what routing does.** New routing behavior needs structured log lines (with `route`, `target`,
-   `attempt` where relevant). Never log API keys. Bodies are logged only when `logging.logBodies` is on.
+   `attempt` where relevant). Always log through the pino logger (never `console`), because the
+   `SecretScrubber` in `src/redact.ts` removes credentials only from pino output. New kinds of
+   credentials in the config must be registered in `SecretScrubber.update`. Bodies are logged only when
+   `logging.logBodies` is on, always through `summarizeForLog`/`summarizeTextForLog`.
 8. **Test behavior changes.** Use the mock upstreams and the forward proxy in `test/helpers.ts`.
    Never call real providers from tests.
 

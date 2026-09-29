@@ -6,8 +6,9 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { connect, type AddressInfo } from 'node:net';
-import { pino } from 'pino';
 import { configSchema, type Config } from '../src/config/schema.js';
+import { createLogger } from '../src/logger.js';
+import { SecretScrubber } from '../src/redact.js';
 import { Runtime } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
 
@@ -147,13 +148,19 @@ export function makeConfig(input: Record<string, unknown>): Config {
   return configSchema.parse({ logging: { level: 'silent' }, ...input });
 }
 
+/** Builds the app with the real logger setup; every log line is captured in `logs`. */
 export function createApp(config: Config) {
-  const logger = pino({ level: config.logging.level });
-  const runtime = new Runtime(config, logger);
+  const logs: string[] = [];
+  const scrubber = new SecretScrubber(config);
+  const logger = createLogger(config.logging, scrubber, {
+    write: (line: string) => logs.push(line),
+  });
+  const runtime = new Runtime(config, logger, scrubber);
   const app = buildServer(runtime, logger);
   return {
     app,
     runtime,
+    logs,
     close: async () => {
       await app.close();
       await runtime.close();
