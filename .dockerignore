@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+test/
+docs/
+.git/
+.github/
+.claude/
+config.yaml
+config.yml
+.env
+.env.*
+*.log

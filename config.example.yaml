@@ -1,0 +1,82 @@
+# TLM (Tiny LLM Router) - example configuration.
+#
+# Copy this file to `config.yaml` (git-ignored) and adjust it:
+#   cp config.example.yaml config.yaml
+#
+# Strings may reference environment variables with ${VAR} or ${VAR:-default}.
+# The file is watched: valid changes are applied without a restart, invalid ones are
+# logged and ignored. See docs/configuration.md for the full reference.
+
+server:
+  host: 0.0.0.0
+  port: 30000 # changing host/port/bodyLimit requires a restart
+
+logging:
+  level: info # trace | debug | info | warn | error | fatal | silent
+  pretty: true # human-readable logs (requires a restart to change); use false for JSON lines
+  logBodies: false # log request/response bodies at debug level
+
+# Optional outbound proxy for upstream calls.
+proxy:
+  url: ${HTTPS_PROXY:-} # empty = no proxy; e.g. http://user:pass@proxy.internal:3128
+  noProxy: [localhost, 127.0.0.1, .internal]
+
+upstream:
+  timeoutMs: 120000 # default per-attempt timeout (headers + first chunk / full body)
+  retryOn: [408, 409, 429, 500, 502, 503, 504] # statuses that trigger a fallback
+
+health:
+  failureThreshold: 3 # consecutive failures before a target cools down
+  cooldownMs: 30000 # how long a failing target is deprioritized
+
+providers:
+  openai:
+    baseUrl: https://api.openai.com/v1
+    apiKey: ${OPENAI_API_KEY}
+
+  groq:
+    baseUrl: https://api.groq.com/openai/v1
+    apiKey: ${GROQ_API_KEY}
+    timeoutMs: 30000
+
+  ollama:
+    baseUrl: http://localhost:11434/v1
+    proxy: false # never use the proxy for this provider
+
+# Each route is a model name exposed by TLM (`"model": "<route>"` in requests).
+routes:
+  # Failover queue: always try OpenAI first, fall back to Groq, then the local model.
+  smart:
+    strategy: priority
+    targets:
+      - { provider: openai, model: gpt-4o }
+      - { provider: groq, model: llama-3.3-70b-versatile }
+      - { provider: ollama, model: llama3.2 }
+
+  # Spread load across two providers.
+  fast:
+    strategy: round-robin
+    targets:
+      - { provider: groq, model: llama-3.1-8b-instant }
+      - { provider: openai, model: gpt-4o-mini }
+
+  # 80/20 split, at most two attempts per request.
+  mixed:
+    strategy: weighted
+    maxAttempts: 2
+    targets:
+      - { provider: openai, model: gpt-4o-mini, weight: 4 }
+      - { provider: groq, model: llama-3.1-8b-instant, weight: 1 }
+
+  # Whichever target has responded fastest recently.
+  quick:
+    strategy: least-latency
+    targets:
+      - { provider: groq, model: llama-3.1-8b-instant }
+      - { provider: openai, model: gpt-4o-mini }
+
+  # Single target, no fallback.
+  embeddings:
+    fallback: false
+    targets:
+      - { provider: openai, model: text-embedding-3-small }
