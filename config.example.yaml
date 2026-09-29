@@ -3,29 +3,47 @@
 # Copy this file to `config.yaml` (git-ignored) and adjust it:
 #   cp config.example.yaml config.yaml
 #
-# Strings may reference environment variables with ${VAR} or ${VAR:-default}.
-# The file is watched: valid changes are applied without a restart, invalid ones are
-# logged and ignored. See docs/configuration.md for the full reference.
+# Environment variables
+# ---------------------
+# Any value can reference an environment variable instead of a literal:
+#   ${VAR}            value of VAR (startup/reload fails if it is unset or empty)
+#   ${VAR:-default}   value of VAR, or `default` if it is unset or empty
+#   ${VAR}           a literal "${VAR}" (escape)
+# Numbers, booleans and lists accept their text form (`port: ${TLM_PORT:-30000}`,
+# `noProxy: ${NO_PROXY:-}` with comma-separated hosts). An empty value means "use the default".
+#
+# Variables come from the process environment and from a `.env` file next to this file
+# (or --env-file / TLM_ENV_FILE). Real environment variables win over `.env` values.
+# See .env.example.
+#
+# Hot reload: this file and the .env file are watched. Valid changes are applied without a
+# restart; invalid ones are logged and ignored. See docs/configuration.md for the full reference.
 
 server:
-  host: 0.0.0.0
-  port: 30000 # changing host/port/bodyLimit requires a restart
+  host: ${TLM_HOST:-0.0.0.0}
+  port: ${TLM_PORT:-30000} # changing host/port/bodyLimit requires a restart
   # Max request size. Images and PDFs sent inline as base64 are ~33% larger than the file,
   # so vision/document routes usually need more than the 10 MB default.
   bodyLimit: 52428800 # 50 MB
+  # Max time TLM spends on a client request, across all fallback attempts and including
+  # streaming. The client gets a 504 when it is exceeded. Routes can override it; 0 = no limit.
+  requestTimeoutMs: ${TLM_REQUEST_TIMEOUT_MS:-600000} # 10 minutes
 
 logging:
-  level: info # trace | debug | info | warn | error | fatal | silent
+  level: ${TLM_LOG_LEVEL:-info} # trace | debug | info | warn | error | fatal | silent
   pretty: true # human-readable logs (requires a restart to change); use false for JSON lines
   logBodies: false # log request/response bodies at debug level
 
 # Optional outbound proxy for upstream calls.
 proxy:
   url: ${HTTPS_PROXY:-} # empty = no proxy; e.g. http://user:pass@proxy.internal:3128
-  noProxy: [localhost, 127.0.0.1, .internal]
+  noProxy: [localhost, 127.0.0.1, .internal] # or: ${NO_PROXY:-} (comma-separated)
 
 upstream:
-  timeoutMs: 120000 # default per-attempt timeout (headers + first chunk / full body)
+  # Default per-attempt timeout: until the full body (or the first chunk when streaming).
+  # A timed-out attempt falls back to the next target. Precedence:
+  #   route timeoutMs > provider timeoutMs > upstream.timeoutMs
+  timeoutMs: 120000
   retryOn: [408, 409, 429, 500, 502, 503, 504] # statuses that trigger a fallback
 
 health:
@@ -40,7 +58,7 @@ providers:
   groq:
     baseUrl: https://api.groq.com/openai/v1
     apiKey: ${GROQ_API_KEY}
-    timeoutMs: 30000
+    timeoutMs: 30000 # Groq is fast; give up early and fall back
 
   ollama:
     baseUrl: http://localhost:11434/v1
@@ -94,8 +112,10 @@ routes:
   # accept files than images, so this route only lists models that do.
   documents:
     strategy: priority
+    timeoutMs: 300000 # long PDFs take a while; overrides provider/upstream attempt timeouts
+    requestTimeoutMs: 900000 # 15 minutes for the whole request, instead of server.requestTimeoutMs
     targets:
-      - { provider: openai, model: gpt-4.1 }
+      - { provider: openai, model: '${DOCUMENTS_MODEL:-gpt-4.1}' }
       - { provider: openai, model: gpt-4o }
 
   # Single target, no fallback.

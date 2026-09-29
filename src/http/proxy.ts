@@ -92,6 +92,7 @@ export async function proxyRequest(
   }
 
   const stream = body.stream === true;
+  const requestTimeoutMs = route.requestTimeoutMs ?? config.server.requestTimeoutMs;
   const plan = runtime.router.plan(routeName, route);
   const log: FastifyBaseLogger = request.log.child({ route: routeName });
   log.info(
@@ -99,6 +100,7 @@ export async function proxyRequest(
       endpoint,
       strategy: route.strategy,
       stream,
+      requestTimeoutMs,
       plan: plan.targets.map(targetKey),
       ...(plan.coolingDown.length > 0 && { coolingDown: plan.coolingDown }),
     },
@@ -112,223 +114,267 @@ export async function proxyRequest(
     if (!reply.raw.writableFinished) abort.abort();
   });
 
+  // Total time budget for this client request, across attempts and including streaming.
+  const requestDeadline = new AbortController();
+  const requestTimer =
+    requestTimeoutMs > 0 ? setTimeout(() => requestDeadline.abort(), requestTimeoutMs) : undefined;
+  const requestSignal = AbortSignal.any([abort.signal, requestDeadline.signal]);
+  requestTimer?.unref();
+  reply.raw.on('close', () => clearTimeout(requestTimer));
+
   const started = performance.now();
   let lastFailure: Failure | undefined;
+  let attempt = 0;
+  let streaming = false;
 
-  for (const [index, target] of plan.targets.entries()) {
-    const attempt = index + 1;
-    const key = targetKey(target);
-    const hasNext = attempt < plan.targets.length;
-    const provider = config.providers[target.provider]!;
-    const { dispatcher, proxy } = generation.dispatchers.get(target.provider);
-    const attemptLog = log.child({ attempt, target: key });
-    const attemptStarted = performance.now();
-
-    const fail = (failure: Failure): void => {
-      lastFailure = failure;
-      const reason = failure.kind === 'http' ? `HTTP ${failure.status}` : failure.reason;
-      const { cooldownStarted, consecutiveFailures } = runtime.health.recordFailure(key, reason);
-      attemptLog.warn(
-        {
-          reason,
-          durationMs: elapsed(attemptStarted),
-          consecutiveFailures,
-          next: hasNext ? 'fallback' : 'give up',
-        },
-        'attempt failed',
+  /** Ends the request if the client left or the request deadline passed; otherwise undefined. */
+  const interrupted = (): FastifyReply | undefined => {
+    if (abort.signal.aborted) return clientGone(log, reply, started);
+    if (requestDeadline.signal.aborted) {
+      log.warn(
+        { requestTimeoutMs, attempts: attempt, durationMs: elapsed(started) },
+        'request timed out',
       );
-      if (cooldownStarted) {
-        attemptLog.warn({ cooldownMs: config.health.cooldownMs }, 'target entered cooldown');
-      }
-    };
-
-    // The deadline covers the response headers and the full body (buffered) or first chunk (stream).
-    const timeoutMs = provider.timeoutMs ?? config.upstream.timeoutMs;
-    const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), timeoutMs);
-    const signal = AbortSignal.any([abort.signal, deadline.signal]);
-    const networkFailure = (error: unknown): Failure =>
-      deadline.signal.aborted
-        ? { kind: 'network', reason: `timed out after ${timeoutMs}ms`, timeout: true }
-        : { kind: 'network', ...describeError(error) };
-
-    attemptLog.debug(
-      { upstreamModel: target.model, timeoutMs, ...(proxy && { proxy }) },
-      'attempt started',
-    );
-
-    let res: UpstreamResponse;
-    try {
-      res = await sendUpstream({
-        provider,
-        dispatcher,
-        path: endpoint,
-        body: { ...body, model: target.model },
-        timeoutMs,
-        signal,
-      });
-    } catch (error) {
-      clearTimeout(timer);
-      if (abort.signal.aborted) return clientGone(log, reply, started);
-      fail(networkFailure(error));
-      continue;
+      reply.header('x-tlm-route', routeName).header('x-tlm-attempts', String(attempt));
+      return sendError(
+        reply,
+        504,
+        `Request to '${routeName}' timed out after ${requestTimeoutMs}ms.`,
+        'upstream_error',
+        'request_timeout',
+      );
     }
+    return undefined;
+  };
 
-    const contentType = header(res, 'content-type');
+  try {
+    for (const [index, target] of plan.targets.entries()) {
+      attempt = index + 1;
+      const key = targetKey(target);
+      const hasNext = attempt < plan.targets.length;
+      const provider = config.providers[target.provider]!;
+      const { dispatcher, proxy } = generation.dispatchers.get(target.provider);
+      const attemptLog = log.child({ attempt, target: key });
+      const attemptStarted = performance.now();
 
-    // Upstream error status: fall back if retryable, otherwise pass it through (minus any echoed secrets).
-    if (res.statusCode >= 400) {
-      const errorBody = await res.body.text().catch(() => '');
-      clearTimeout(timer);
-      if (config.upstream.retryOn.includes(res.statusCode)) {
-        fail({ kind: 'http', status: res.statusCode, body: errorBody, contentType });
-        if (hasNext) continue;
-      } else {
-        attemptLog.info(
-          { status: res.statusCode, durationMs: elapsed(attemptStarted) },
-          'non-retryable upstream error; returning it to the client',
+      const fail = (failure: Failure): void => {
+        lastFailure = failure;
+        const reason = failure.kind === 'http' ? `HTTP ${failure.status}` : failure.reason;
+        const { cooldownStarted, consecutiveFailures } = runtime.health.recordFailure(key, reason);
+        attemptLog.warn(
+          {
+            reason,
+            durationMs: elapsed(attemptStarted),
+            consecutiveFailures,
+            next: hasNext ? 'fallback' : 'give up',
+          },
+          'attempt failed',
         );
-      }
-      if (config.logging.logBodies)
-        attemptLog.debug({ body: summarizeTextForLog(errorBody) }, 'upstream error body');
-      setRoutingHeaders(reply, res, routeName, target, attempt);
-      log.info(
-        { status: res.statusCode, target: key, attempts: attempt, durationMs: elapsed(started) },
-        'request failed',
-      );
-      return reply
-        .code(res.statusCode)
-        .type(contentType ?? 'application/json')
-        .send(runtime.scrub(errorBody));
-    }
+        if (cooldownStarted) {
+          attemptLog.warn({ cooldownMs: config.health.cooldownMs }, 'target entered cooldown');
+        }
+      };
 
-    // Buffered (non-streaming) response.
-    if (!stream) {
-      let text: string;
+      // The attempt deadline covers the response headers and the full body (buffered) or the first
+      // chunk (stream). The request deadline still applies on top of it.
+      const timeoutMs = route.timeoutMs ?? provider.timeoutMs ?? config.upstream.timeoutMs;
+      const deadline = new AbortController();
+      const timer = setTimeout(() => deadline.abort(), timeoutMs);
+      const signal = AbortSignal.any([requestSignal, deadline.signal]);
+      const networkFailure = (error: unknown): Failure =>
+        deadline.signal.aborted
+          ? { kind: 'network', reason: `timed out after ${timeoutMs}ms`, timeout: true }
+          : { kind: 'network', ...describeError(error) };
+
+      attemptLog.debug(
+        { upstreamModel: target.model, timeoutMs, ...(proxy && { proxy }) },
+        'attempt started',
+      );
+
+      let res: UpstreamResponse;
       try {
-        text = await res.body.text();
+        res = await sendUpstream({
+          provider,
+          dispatcher,
+          path: endpoint,
+          body: { ...body, model: target.model },
+          timeoutMs,
+          signal,
+        });
       } catch (error) {
-        if (abort.signal.aborted) return clientGone(log, reply, started);
+        clearTimeout(timer);
+        const stop = interrupted();
+        if (stop) return stop;
+        fail(networkFailure(error));
+        continue;
+      }
+
+      const contentType = header(res, 'content-type');
+
+      // Upstream error status: fall back if retryable, otherwise pass it through (minus any echoed secrets).
+      if (res.statusCode >= 400) {
+        const errorBody = await res.body.text().catch(() => '');
+        clearTimeout(timer);
+        if (config.upstream.retryOn.includes(res.statusCode)) {
+          fail({ kind: 'http', status: res.statusCode, body: errorBody, contentType });
+          if (hasNext) continue;
+        } else {
+          attemptLog.info(
+            { status: res.statusCode, durationMs: elapsed(attemptStarted) },
+            'non-retryable upstream error; returning it to the client',
+          );
+        }
+        if (config.logging.logBodies)
+          attemptLog.debug({ body: summarizeTextForLog(errorBody) }, 'upstream error body');
+        setRoutingHeaders(reply, res, routeName, target, attempt);
+        log.info(
+          { status: res.statusCode, target: key, attempts: attempt, durationMs: elapsed(started) },
+          'request failed',
+        );
+        return reply
+          .code(res.statusCode)
+          .type(contentType ?? 'application/json')
+          .send(runtime.scrub(errorBody));
+      }
+
+      // Buffered (non-streaming) response.
+      if (!stream) {
+        let text: string;
+        try {
+          text = await res.body.text();
+        } catch (error) {
+          if (abort.signal.aborted) return clientGone(log, reply, started);
+          fail(networkFailure(error));
+          continue;
+        } finally {
+          clearTimeout(timer);
+        }
+        runtime.health.recordSuccess(key, elapsed(attemptStarted));
+        if (config.logging.logBodies)
+          attemptLog.debug({ body: summarizeTextForLog(text) }, 'response body');
+        log.info(
+          {
+            status: res.statusCode,
+            target: key,
+            attempts: attempt,
+            durationMs: elapsed(started),
+            usage: extractUsage(text),
+          },
+          'request completed',
+        );
+        setRoutingHeaders(reply, res, routeName, target, attempt);
+        return reply
+          .code(res.statusCode)
+          .type(contentType ?? 'application/json')
+          .send(text);
+      }
+
+      // Streaming response: wait for the first chunk before committing to this target.
+      const iterator: AsyncIterator<Buffer> = res.body[Symbol.asyncIterator]();
+      let first: IteratorResult<Buffer>;
+      try {
+        first = await iterator.next();
+      } catch (error) {
+        const stop = interrupted();
+        if (stop) return stop;
         fail(networkFailure(error));
         continue;
       } finally {
         clearTimeout(timer);
       }
-      runtime.health.recordSuccess(key, elapsed(attemptStarted));
-      if (config.logging.logBodies)
-        attemptLog.debug({ body: summarizeTextForLog(text) }, 'response body');
-      log.info(
-        {
-          status: res.statusCode,
-          target: key,
-          attempts: attempt,
-          durationMs: elapsed(started),
-          usage: extractUsage(text),
-        },
-        'request completed',
-      );
+
+      streaming = true;
+      const firstByteMs = elapsed(attemptStarted);
+      runtime.health.recordSuccess(key, firstByteMs);
+      attemptLog.debug({ firstByteMs }, 'stream started');
       setRoutingHeaders(reply, res, routeName, target, attempt);
-      return reply
-        .code(res.statusCode)
-        .type(contentType ?? 'application/json')
-        .send(text);
-    }
 
-    // Streaming response: wait for the first chunk before committing to this target.
-    const iterator: AsyncIterator<Buffer> = res.body[Symbol.asyncIterator]();
-    let first: IteratorResult<Buffer>;
-    try {
-      first = await iterator.next();
-    } catch (error) {
-      if (abort.signal.aborted) return clientGone(log, reply, started);
-      fail(networkFailure(error));
-      continue;
-    } finally {
-      clearTimeout(timer);
-    }
-
-    const firstByteMs = elapsed(attemptStarted);
-    runtime.health.recordSuccess(key, firstByteMs);
-    attemptLog.debug({ firstByteMs }, 'stream started');
-    setRoutingHeaders(reply, res, routeName, target, attempt);
-
-    async function* relay(): AsyncGenerator<Buffer> {
-      const sniffer = new UsageSniffer();
-      let bytes = 0;
-      let completed = false;
-      try {
-        if (!first.done) {
-          sniffer.push(first.value);
-          bytes += first.value.length;
-          yield first.value;
-        }
-        for (;;) {
-          const next = await iterator.next();
-          if (next.done) break;
-          sniffer.push(next.value);
-          bytes += next.value.length;
-          yield next.value;
-        }
-        completed = true;
-      } catch (error) {
-        if (!abort.signal.aborted) {
-          const { reason } = describeError(error);
-          runtime.health.recordFailure(key, reason);
-          log.error(
-            { target: key, reason, bytes },
-            'upstream stream failed after the first byte; cannot fall back',
+      async function* relay(): AsyncGenerator<Buffer> {
+        const sniffer = new UsageSniffer();
+        let bytes = 0;
+        let completed = false;
+        try {
+          if (!first.done) {
+            sniffer.push(first.value);
+            bytes += first.value.length;
+            yield first.value;
+          }
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done) break;
+            sniffer.push(next.value);
+            bytes += next.value.length;
+            yield next.value;
+          }
+          completed = true;
+        } catch (error) {
+          if (requestDeadline.signal.aborted) {
+            log.warn({ target: key, requestTimeoutMs, bytes }, 'request timed out while streaming');
+          } else if (!abort.signal.aborted) {
+            const { reason } = describeError(error);
+            runtime.health.recordFailure(key, reason);
+            log.error(
+              { target: key, reason, bytes },
+              'upstream stream failed after the first byte; cannot fall back',
+            );
+          }
+          throw error;
+        } finally {
+          clearTimeout(requestTimer);
+          if (!completed) await iterator.return?.().catch(() => undefined);
+          const outcome = completed
+            ? 'request completed'
+            : abort.signal.aborted
+              ? 'client disconnected'
+              : requestDeadline.signal.aborted
+                ? 'request timed out'
+                : 'stream interrupted';
+          log[completed ? 'info' : 'warn'](
+            {
+              status: res.statusCode,
+              target: key,
+              attempts: attempt,
+              stream: true,
+              firstByteMs,
+              durationMs: elapsed(started),
+              bytes,
+              usage: sniffer.usage,
+            },
+            outcome,
           );
         }
-        throw error;
-      } finally {
-        if (!completed) await iterator.return?.().catch(() => undefined);
-        const outcome = completed
-          ? 'request completed'
-          : abort.signal.aborted
-            ? 'client disconnected'
-            : 'stream interrupted';
-        log[completed ? 'info' : 'warn'](
-          {
-            status: res.statusCode,
-            target: key,
-            attempts: attempt,
-            stream: true,
-            firstByteMs,
-            durationMs: elapsed(started),
-            bytes,
-            usage: sniffer.usage,
-          },
-          outcome,
-        );
       }
+
+      return reply
+        .code(res.statusCode)
+        .header('content-type', contentType ?? 'text/event-stream')
+        .header('cache-control', 'no-cache')
+        .header('x-accel-buffering', 'no')
+        .send(Readable.from(relay()));
     }
 
-    return reply
-      .code(res.statusCode)
-      .header('content-type', contentType ?? 'text/event-stream')
-      .header('cache-control', 'no-cache')
-      .header('x-accel-buffering', 'no')
-      .send(Readable.from(relay()));
+    // Every target failed.
+    const attempts = plan.targets.length;
+    log.error({ attempts, durationMs: elapsed(started) }, 'all targets failed');
+    reply.header('x-tlm-route', routeName).header('x-tlm-attempts', String(attempts));
+    if (lastFailure?.kind === 'http') {
+      return reply
+        .code(lastFailure.status)
+        .type(lastFailure.contentType ?? 'application/json')
+        .send(runtime.scrub(lastFailure.body));
+    }
+    const timeout = lastFailure?.kind === 'network' && lastFailure.timeout;
+    return sendError(
+      reply,
+      timeout ? 504 : 502,
+      `All upstream targets for '${routeName}' failed. Last error: ${lastFailure?.kind === 'network' ? lastFailure.reason : 'unknown'}`,
+      'upstream_error',
+      timeout ? 'upstream_timeout' : 'upstream_unavailable',
+    );
+  } finally {
+    // A committed stream clears the request timer when it ends (see relay).
+    if (!streaming) clearTimeout(requestTimer);
   }
-
-  // Every target failed.
-  const attempts = plan.targets.length;
-  log.error({ attempts, durationMs: elapsed(started) }, 'all targets failed');
-  reply.header('x-tlm-route', routeName).header('x-tlm-attempts', String(attempts));
-  if (lastFailure?.kind === 'http') {
-    return reply
-      .code(lastFailure.status)
-      .type(lastFailure.contentType ?? 'application/json')
-      .send(runtime.scrub(lastFailure.body));
-  }
-  const timeout = lastFailure?.kind === 'network' && lastFailure.timeout;
-  return sendError(
-    reply,
-    timeout ? 504 : 502,
-    `All upstream targets for '${routeName}' failed. Last error: ${lastFailure?.kind === 'network' ? lastFailure.reason : 'unknown'}`,
-    'upstream_error',
-    timeout ? 'upstream_timeout' : 'upstream_unavailable',
-  );
 }
 
 function clientGone(log: FastifyBaseLogger, reply: FastifyReply, started: number): FastifyReply {

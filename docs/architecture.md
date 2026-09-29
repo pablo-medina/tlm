@@ -21,8 +21,8 @@ src/
   redact.ts             SecretScrubber and body summarizing for logs
   config/
     schema.ts           zod schema, defaults and derived types (single source of truth)
-    load.ts             YAML parsing, ${ENV} interpolation, validation errors
-    watcher.ts          File watcher for hot reload
+    load.ts             YAML parsing, .env reading, ${ENV} interpolation, validation errors
+    watcher.ts          Watches the config and .env files for hot reload
   routing/
     strategies.ts       Strategy functions: route targets → attempt order
     router.ts           Applies strategy, cooldown ordering, fallback/maxAttempts limits
@@ -57,6 +57,15 @@ close the connection.
 **Bodies pass through.** TLM parses the request only to read `model` and `stream` and to replace
 `model` with the upstream name. Everything else (tools, response_format, provider-specific fields) is
 forwarded unchanged. Upstream responses are forwarded unchanged as well.
+
+**Two deadlines per request.** The request deadline (`server.requestTimeoutMs` or the route override)
+spans every attempt and the whole stream. It aborts the in-flight call and stops the fallback loop,
+without penalizing the target. Each attempt also has its own deadline (route, then provider, then
+`upstream.timeoutMs`). Both are combined with the client-disconnect signal through `AbortSignal.any`.
+
+**Environment variables are resolved, never injected.** `.env` values are merged with `process.env`
+(the process wins) only to resolve `${VAR}` references. `process.env` is never modified, so a reload
+can re-read `.env` cleanly.
 
 **Timeouts use an AbortSignal per attempt.** undici's own timers are coarse (about one second), so
 each attempt has a precise deadline combined with the client-disconnect signal. undici's

@@ -1,7 +1,6 @@
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { ConfigError, loadConfig } from './config/load.js';
+import { ConfigError, loadConfigSource, type ConfigSource } from './config/load.js';
 import { ConfigWatcher } from './config/watcher.js';
 import { createLogger } from './logger.js';
 import { SecretScrubber } from './redact.js';
@@ -10,19 +9,31 @@ import { buildServer } from './server.js';
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
-    options: { config: { type: 'string', short: 'c' } },
+    options: {
+      config: { type: 'string', short: 'c' },
+      'env-file': { type: 'string', short: 'e' },
+    },
   });
-  if (existsSync('.env')) process.loadEnvFile('.env');
 
   const configPath = resolve(values.config ?? process.env.TLM_CONFIG ?? 'config.yaml');
-  const config = await loadConfig(configPath);
+  // An explicit env file must exist; the default `.env` next to the config file is optional.
+  const explicitEnvFile = values['env-file'] ?? process.env.TLM_ENV_FILE;
+  const source: ConfigSource = {
+    configPath,
+    envFile: explicitEnvFile
+      ? { path: resolve(explicitEnvFile), required: true }
+      : { path: join(dirname(configPath), '.env'), required: false },
+  };
+
+  const config = await loadConfigSource(source);
   const scrubber = new SecretScrubber(config);
   const logger = createLogger(config.logging, scrubber);
   const runtime = new Runtime(config, logger, scrubber);
   const app = buildServer(runtime, logger);
 
   const watcher = new ConfigWatcher({
-    path: configPath,
+    files: [source.configPath, source.envFile.path],
+    load: () => loadConfigSource(source),
     logger,
     onReload: (next) => runtime.apply(next),
   });
@@ -46,6 +57,7 @@ async function main(): Promise<void> {
   logger.info(
     {
       config: configPath,
+      envFile: source.envFile.path,
       routes: Object.keys(config.routes),
       providers: Object.keys(config.providers),
     },

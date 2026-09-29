@@ -14,6 +14,10 @@ config interfaces by hand.
    - Give it a `.default(...)` unless it must be required or truly optional.
    - Add a short doc comment.
    - Nested objects use `.prefault({})` so inner defaults apply.
+   - Wrap non-string fields with the `num()`, `bool()` or `list()` helpers, so they also accept
+     values from `${VAR}` placeholders (which are always strings; an empty string means "use the
+     default"). Add a case to the "environment variables in non-string settings" tests.
+   - For overridable settings, follow the existing precedence: route, then provider, then global.
    - Cross-field rules go in the `superRefine` at the bottom.
 2. **Use it.** Read it from the request's generation (`runtime.current.config` captured at the start
    of `proxyRequest`), not from a module-level variable. This keeps hot reload consistent.

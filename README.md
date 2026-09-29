@@ -15,7 +15,11 @@ It does one thing: routing. No prompt management, no caching, no UI.
   streaming requests that fail before the first byte.
 - **Health tracking:** failing targets enter a cooldown and are deprioritized automatically.
 - **Outbound proxy:** optional global HTTP(S) proxy with `noProxy` rules and per-provider overrides.
-- **Hot reload:** the YAML configuration is watched; valid changes apply without a restart.
+- **Configurable timeouts:** a total request timeout and a per-attempt timeout, each global with
+  per-route overrides.
+- **Environment-friendly config:** YAML with `${VAR}` references, including for numbers and booleans,
+  plus `.env` support.
+- **Hot reload:** the YAML configuration and `.env` are watched; valid changes apply without a restart.
 - **Multimodal passthrough:** images, PDFs and audio content parts are forwarded untouched.
 - **Observable:** structured logs (JSON or pretty) for every request, attempt, fallback and reload,
   with API keys scrubbed and base64 payloads summarized.
@@ -78,10 +82,32 @@ routes:
 - **Providers** are OpenAI-compatible endpoints (`baseUrl`, `apiKey`, extra `headers`, `timeoutMs`, `proxy`).
 - **Routes** are the model names TLM exposes. Each has a `strategy` and an ordered list of `targets`
   (`provider` + upstream `model`).
-- `${VAR}` and `${VAR:-default}` are replaced with environment variables. A `.env` file in the working
-  directory is loaded automatically.
+  The configuration file is resolved from `--config <path>`, then `TLM_CONFIG`, then `./config.yaml`.
 
-The configuration file is resolved from `--config <path>`, then `TLM_CONFIG`, then `./config.yaml`.
+### Environment variables and `.env`
+
+The YAML file is always the source of configuration, but any value in it can reference an
+environment variable. Use this for secrets, or for settings you prefer to manage per deployment:
+
+```yaml
+server:
+  port: ${TLM_PORT:-30000} # TLM_PORT, or 30000 if unset
+  requestTimeoutMs: ${TLM_REQUEST_TIMEOUT_MS:-600000}
+logging:
+  level: ${TLM_LOG_LEVEL:-info}
+providers:
+  openai:
+    baseUrl: https://api.openai.com/v1
+    apiKey: ${OPENAI_API_KEY} # required: startup fails if unset
+```
+
+- `${VAR}` requires the variable. `${VAR:-default}` provides a fallback. `$${VAR}` is a literal `${VAR}`.
+- Numbers, booleans and lists also accept their text form. For example, `TLM_PORT=8080` works, and
+  `NO_PROXY=localhost,.internal` can feed `proxy.noProxy`.
+- Variables come from the process environment and from a `.env` file next to the config file (or
+  `--env-file <path>` / `TLM_ENV_FILE`). Real environment variables win over `.env`. See
+  [.env.example](.env.example).
+- Both files are watched, so editing `.env` triggers a hot reload too.
 
 See [docs/configuration.md](docs/configuration.md) for every option, and
 [config.example.yaml](config.example.yaml) for an annotated example.
@@ -110,6 +136,18 @@ of targets tried per request.
 | Stream fails **before** the first chunk                              | Try the next target                            |
 | Stream fails **after** the first chunk                               | Connection is closed; no fallback is possible  |
 | Every target failed                                                  | Return the last upstream error, or `502`/`504` |
+
+## Timeouts
+
+| Limit                                                                      | Global                                         | Override                                                     |
+| -------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
+| **Request:** client ↔ TLM, whole request including fallbacks and streaming | `server.requestTimeoutMs` (10 min; `0` = none) | `routes.<name>.requestTimeoutMs`                             |
+| **Attempt:** TLM ↔ one target                                              | `upstream.timeoutMs` (2 min)                   | `providers.<name>.timeoutMs`, then `routes.<name>.timeoutMs` |
+
+The most specific value wins. A route without its own value uses the global one. When the request
+timeout is exceeded, the client gets `504 request_timeout`, or the stream is closed if it has
+already started. When an attempt times out, TLM falls back to the next target. See
+[docs/configuration.md](docs/configuration.md#timeouts) for details.
 
 ## Responses
 
@@ -210,7 +248,7 @@ HTTPS targets are tunnelled with `CONNECT`. Plain HTTP targets are forwarded thr
 
 ## Hot reload
 
-TLM watches the configuration file. When the file changes:
+TLM watches the configuration file and the `.env` file. When either changes:
 
 - If the new file is valid, it replaces the active configuration. In-flight requests finish with the
   configuration they started with, and health state and round-robin counters are kept.
@@ -223,11 +261,12 @@ Sending `SIGHUP` forces a reload.
 
 ```bash
 docker build -t tlm .
-docker run -p 30000:30000 -v "$PWD/config.yaml:/config/config.yaml:ro" -e OPENAI_API_KEY tlm
+docker run -p 30000:30000 -v "$PWD/deploy:/config:ro" -e OPENAI_API_KEY tlm
 ```
 
-The image reads `/config/config.yaml` by default. Mounting the whole directory (not just the file)
-makes hot reload more reliable with editors that replace files.
+The image reads `/config/config.yaml`, and `/config/.env` if it exists. Mount the directory rather
+than individual files, so hot reload also works with editors that replace files. Variables passed
+with `-e` or `env_file:` (Compose) override the mounted `.env`.
 
 ## Development
 

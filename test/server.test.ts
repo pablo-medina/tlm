@@ -1,3 +1,4 @@
+import type { ServerResponse } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   chat,
@@ -10,6 +11,7 @@ import {
   statusHandler,
   streamHandler,
   type MockUpstream,
+  type ReceivedRequest,
 } from './helpers.js';
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -269,6 +271,101 @@ describe('fallback', () => {
     expect(res.headers['x-tlm-attempts']).toBe('1');
     expect(a.received).toHaveLength(1);
     expect(b.received).toHaveLength(2);
+  });
+});
+
+describe('timeouts', () => {
+  const delayed = (ms: number) => async (req: ReceivedRequest, res: ServerResponse) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    okHandler(`after ${ms}ms`)(req, res);
+  };
+
+  it('stops the whole request, including fallbacks, at server.requestTimeoutMs', async () => {
+    const a = await upstream(delayed(400));
+    const b = await upstream(okHandler('never reached'));
+    const { app: server, runtime } = app({
+      server: { requestTimeoutMs: 150 },
+      providers: { a: { baseUrl: a.url }, b: { baseUrl: b.url } },
+      routes: {
+        smart: {
+          targets: [
+            { provider: 'a', model: 'm' },
+            { provider: 'b', model: 'm' },
+          ],
+        },
+      },
+    });
+
+    const res = await server.inject(chat('smart'));
+
+    expect(res.statusCode).toBe(504);
+    expect(res.json().error.code).toBe('request_timeout');
+    expect(res.headers['x-tlm-attempts']).toBe('1');
+    expect(b.received).toHaveLength(0);
+    // Running out of request budget is not the target's fault.
+    expect(runtime.health.snapshot(['a/m'])[0]!.consecutiveFailures).toBe(0);
+  });
+
+  it('lets a route override the global request timeout (0 disables it)', async () => {
+    const a = await upstream(delayed(250));
+    const { app: server } = app({
+      server: { requestTimeoutMs: 100 },
+      providers: { a: { baseUrl: a.url } },
+      routes: {
+        global: { targets: [{ provider: 'a', model: 'm' }] },
+        unlimited: { requestTimeoutMs: 0, targets: [{ provider: 'a', model: 'm' }] },
+        longer: { requestTimeoutMs: 2000, targets: [{ provider: 'a', model: 'm' }] },
+      },
+    });
+
+    expect((await server.inject(chat('global'))).statusCode).toBe(504);
+    expect((await server.inject(chat('unlimited'))).statusCode).toBe(200);
+    expect((await server.inject(chat('longer'))).statusCode).toBe(200);
+  });
+
+  it('uses route timeoutMs over provider and global attempt timeouts', async () => {
+    const a = await upstream(delayed(250));
+    const { app: server } = app({
+      upstream: { timeoutMs: 100 },
+      providers: { a: { baseUrl: a.url }, slowOk: { baseUrl: a.url, timeoutMs: 2000 } },
+      routes: {
+        global: { targets: [{ provider: 'a', model: 'm' }] },
+        provider: { targets: [{ provider: 'slowOk', model: 'm' }] },
+        route: { timeoutMs: 2000, targets: [{ provider: 'a', model: 'm' }] },
+        strict: { timeoutMs: 100, targets: [{ provider: 'slowOk', model: 'm' }] },
+      },
+    });
+
+    const global = await server.inject(chat('global'));
+    expect(global.statusCode).toBe(504);
+    expect(global.json().error.code).toBe('upstream_timeout');
+    expect((await server.inject(chat('provider'))).statusCode).toBe(200);
+    expect((await server.inject(chat('route'))).statusCode).toBe(200);
+    expect((await server.inject(chat('strict'))).statusCode).toBe(504);
+  });
+
+  it('cuts a stream that exceeds the request timeout', async () => {
+    const a = await upstream(async (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (let i = 0; i < 20; i++) {
+        if (res.destroyed) return;
+        res.write(`data: {"i":${i}}\n\n`);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      res.end('data: [DONE]\n\n');
+    });
+    const { app: server, logs } = app({
+      logging: { level: 'info' },
+      server: { requestTimeoutMs: 200 },
+      providers: { a: { baseUrl: a.url } },
+      routes: { smart: { targets: [{ provider: 'a', model: 'm' }] } },
+    });
+
+    const res = await server.inject(chat('smart', { stream: true })).catch(() => undefined);
+
+    expect(res?.body ?? '').not.toContain('[DONE]');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(logs.join('')).toContain('request timed out while streaming');
   });
 });
 
