@@ -8,7 +8,8 @@ Read `docs/architecture.md` before making structural changes.
 1. **English only.** Code, identifiers, comments, log messages, error messages, tests, commit messages,
    docs and config examples must be written in English, even when the conversation is in another language.
 2. **Stay small.** TLM only routes requests. Do not add features outside routing, fallbacks, health,
-   proxying, configuration and logging (no caching, prompt management, UI, databases, client auth)
+   proxying, configuration and logging (no caching, prompt management, UI, databases, client auth,
+   rate limits or quotas; see "Non-goals" in `docs/architecture.md`)
    unless the user explicitly asks.
 3. **Never commit local configuration or secrets.** `config.yaml`, `.env` and similar files are
    git-ignored. Only `config.example.yaml` and `.env.example` are tracked, and they must never contain

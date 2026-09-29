@@ -4,7 +4,7 @@ TLM is a small Node.js + TypeScript microservice that exposes an **OpenAI-compat
 each request to one of several **OpenAI-compatible providers** (OpenAI, Groq, OpenRouter, vLLM,
 Ollama, LM Studio, …) using configurable strategies, with automatic **fallbacks** for availability.
 
-It does one thing: routing. No prompt management, no caching, no UI.
+It does one thing: routing. See [What TLM does not do](#what-tlm-does-not-do).
 
 ## Features
 
@@ -23,6 +23,27 @@ It does one thing: routing. No prompt management, no caching, no UI.
 - **Multimodal passthrough:** images, PDFs and audio content parts are forwarded untouched.
 - **Observable:** structured logs (JSON or pretty) for every request, attempt, fallback and reload,
   with API keys scrubbed and base64 payloads summarized.
+
+## What TLM does not do
+
+TLM sits between your applications and the providers. It does not know who the end users are, so it
+leaves per-user rules to the service that calls it:
+
+- **No client authentication.** TLM is meant for private networks. Put a gateway in front of it if it
+  must be exposed.
+- **No rate limits, quotas or budgets.** A limit inside TLM would be shared by every user of a route,
+  so one heavy user would block everyone else. Per-user or per-application limits belong in the
+  consuming service, which knows its users. Provider rate limits (`429`) are still handled with
+  fallbacks and cooldowns.
+- **No prompt management, caching, UI or persistence.**
+
+What TLM gives the consuming service to enforce its own rules:
+
+- **`usage`** (prompt and completion tokens) is returned unchanged, so the consuming service can
+  meter consumption per user. For streams, request it with `stream_options.include_usage`.
+- **`x-request-id`** is reused if the caller sends it and echoed back, so a user's request can be
+  correlated with TLM's logs. `x-tlm-provider` and `x-tlm-model` show which target served it.
+- **The `user` field** of the request body is forwarded to the provider unchanged.
 
 ## Quick start
 

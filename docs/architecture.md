@@ -76,5 +76,24 @@ each attempt has a precise deadline combined with the client-disconnect signal. 
 line. This also covers error messages and upstream bodies that echo a key. `Runtime.apply` refreshes
 the list on reload.
 
-**No client auth.** TLM is designed for private networks. Put it behind a gateway if it must be
-exposed.
+## Non-goals
+
+TLM routes requests. It does not know which application or end user sent a request. Anything that
+depends on that knowledge belongs in the service that consumes TLM:
+
+- **Client authentication.** TLM is designed for private networks. Put it behind a gateway if it must
+  be exposed.
+- **Rate limits, quotas and budgets.** A global or per-route limit in TLM would be shared by every user
+  of that route, so one heavy user would throttle everyone. Fair limits need per-user rules, which are
+  business rules of the consuming service. Upstream `429` responses are handled by the existing
+  fallback and cooldown logic. They are routing concerns, not limits.
+- **Shared state across instances.** All state (health, counters) is in memory, per instance. Adding
+  a store such as Redis would contradict the "stay small" goal.
+
+Consuming services get what they need to enforce their own rules: the upstream `usage` in every
+response, `x-request-id` correlation (a caller-supplied id is reused), the `x-tlm-*` headers, and the
+`user` field passed through to the provider.
+
+Routing-shaped protections are still in scope, because they choose a target rather than reject a
+request. Examples are a per-target concurrency cap that falls back when a local GPU is saturated,
+and honoring `Retry-After` for cooldowns.
